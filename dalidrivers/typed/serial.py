@@ -30,7 +30,6 @@ from operator import xor
 from typing import (
     Any,
     Callable,
-    Generator,
     NamedTuple,
     Optional,
     Sequence,
@@ -58,15 +57,6 @@ if TYPE_CHECKING:
 
 # trace_logging adds a 'trace' method to the Logger class at import time.
 _LOG = cast("_TraceLogger", logging.getLogger("dalidrivers.misc"))
-
-# A DALI sequence yields commands to transmit (and may yield sleep/progress
-# markers) and is sent each command's response (or None). Its return value is
-# sequence-specific.
-DaliSequence = Generator[
-    command.Command | sequences.sleep | sequences.progress,
-    Optional[command.Response[Any]],
-    Any,
-]
 
 # Sentinel placed on the raw DALI response queue when the interface reports a
 # framing error, so a waiting query returns an error response instead of
@@ -98,7 +88,7 @@ def _drain_queue(queue: asyncio.Queue[Any]) -> list[Any]:
 
 def _single_command_sequence(
     cmd: command.Command,
-) -> DaliSequence:
+) -> sequences.DALISequence[Any]:
     """Wrap a single command as a trivial sequence that returns its response."""
     return (yield cmd)
 
@@ -309,7 +299,7 @@ class DriverSerialBase:
 
     async def send(
         self,
-        msg: command.Command | DaliSequence,
+        msg: command.Command | sequences.DALISequence[Any],
         *,
         priority: int = 5,
         progress: Optional[Callable[[str | sequences.progress], None]] = None,
@@ -383,7 +373,7 @@ class DriverSerialBase:
 
     async def run_sequence(
         self,
-        seq: DaliSequence,
+        seq: sequences.DALISequence[Any],
         progress: Optional[Callable[[str | sequences.progress], None]] = None,
     ) -> Any:
         """
