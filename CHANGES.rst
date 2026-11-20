@@ -8,6 +8,7 @@ Changes
 - Add a synchronous driver for Philips/Signify USB2DALI (LCN8600, USB
   0471:0003), with 16-bit frames, backward-frame responses, optional bus
   power control, and offline HID protocol tests.
+- Move drivers with type annotations to dalidrivers.misc.typed
 
 0.2
 ---
