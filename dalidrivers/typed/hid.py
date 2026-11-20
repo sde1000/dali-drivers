@@ -4,6 +4,8 @@
 # See examples/50-dali-hid.rules for udev rules that will make
 # suitably-named symlinks to the hidraw devices on Linux
 
+from __future__ import annotations
+
 import asyncio
 import os
 import struct
@@ -11,7 +13,10 @@ import logging
 import random
 import glob
 import warnings
+from typing import Any, Callable, Iterator, TYPE_CHECKING
+from dali.device.helpers import DeviceInstanceTypeMapper
 from dali.exceptions import UnsupportedFrameTypeError, CommunicationError
+import dali.sequences
 from dali.sequences import sleep as seq_sleep
 from dali.sequences import progress as seq_progress
 import dali.frame
@@ -21,38 +26,46 @@ import dali.command
 import dali.gear
 from dali.gear.general import EnableDeviceType
 
-def _hex(b):
+
+def _hex(b: bytes) -> str:
     return ''.join("%02X" % x for x in b)
 
 
-def _single_command_sequence(cmd):
+def _single_command_sequence(
+    cmd: dali.command.Command,
+) -> dali.sequences.DALISequence[Any]:
     """Wrap a single command as a trivial sequence that returns its response."""
     return (yield cmd)
+
 
 class _callback:
     """Helper class for callback registration
     """
-    def __init__(self, parent):
+    def __init__(self, parent: hid) -> None:
         self._parent = parent
-        self._callbacks = {}
+        self._callbacks: dict[
+            _callback._callback_handle, Callable[..., object]
+        ] = {}
 
     class _callback_handle:
         """Callback handle
 
         Call unregister() to remove this callback.
         """
-        def __init__(self, callback):
+        def __init__(self, callback: _callback) -> None:
             self._callback = callback
 
-        def unregister(self):
+        def unregister(self) -> None:
             del self._callback._callbacks[self]
 
-    def register(self, func):
+    def register(
+        self, func: Callable[..., object]
+    ) -> _callback._callback_handle:
         wrapper = self._callback_handle(self)
         self._callbacks[wrapper] = func
         return wrapper
 
-    def _invoke(self, *args):
+    def _invoke(self, *args: object) -> None:
         for func in self._callbacks.values():
             asyncio.get_running_loop().call_soon(func, self._parent, *args)
 
@@ -60,17 +73,19 @@ class _callback:
 class hid:
     """Shared code for drivers that work with HID devices
     """
-    def __init__(self, path, reconnect_interval=1, reconnect_limit=None,
-                 glob=False, dev_inst_map=None):
+    def __init__(self, path: str, reconnect_interval: float = 1,
+                 reconnect_limit: int | None = None,
+                 glob: bool = False,
+                 dev_inst_map: DeviceInstanceTypeMapper | None = None) -> None:
         self._log = logging.getLogger()
         self._path = path
         self._reconnect_interval = reconnect_interval
         self._reconnect_limit = reconnect_limit
         self._reconnect_count = 0
-        self._reconnect_task = None
+        self._reconnect_task: asyncio.Task[None] | None = None
         self._glob = glob
         self.dev_inst_map = dev_inst_map
-        self._f = None
+        self._f: int | None = None
 
         # Should the send() method raise an exception if there is a
         # problem communicating with the underlying device, or should
@@ -104,10 +119,10 @@ class hid:
         # devices, and will read as None on devices that don't support
         # reading them.  They are only valid after self.connected is
         # set.
-        self.firmware_version = None
-        self.serial = None
+        self.firmware_version: str | None = None
+        self.serial: str | None = None
 
-    def connect(self):
+    def connect(self) -> bool:
         """Attempt to connect to the device.
 
         Attempts to open the device.  If this fails, schedules a
@@ -152,7 +167,7 @@ class hid:
         self.connection_status_callback._invoke("connected")
         return True
 
-    async def _reconnect(self):
+    async def _reconnect(self) -> None:
         self._reconnect_count += 1
         if self._reconnect_limit is not None \
            and self._reconnect_count > self._reconnect_limit:
@@ -165,7 +180,7 @@ class hid:
         self._reconnect_task = None
         self.connect()
 
-    def disconnect(self, reconnect=False):
+    def disconnect(self, reconnect: bool = False) -> None:
         self._log.debug("disconnecting")
         if self._reconnect_task:
             self._reconnect_task.cancel()
@@ -180,7 +195,14 @@ class hid:
         if reconnect:
             self._reconnect_task = asyncio.ensure_future(self._reconnect())
 
-    async def send(self, msg, *, priority=5, progress=None, exceptions=None):
+    async def send(
+        self,
+        msg: dali.command.Command | dali.sequences.DALISequence[Any],
+        *,
+        priority: int = 5,
+        progress: Callable[[str | dali.sequences.progress], None] | None = None,
+        exceptions: bool | None = None,
+    ) -> Any:
         """Send a command or run a sequence as a single transaction
 
         A bare Command is wrapped in a trivial sequence, so a single command
@@ -246,7 +268,10 @@ class hid:
             self.transaction_lock.release()
             seq.close()
 
-    async def power_supply(self, supply_on, in_transaction=False, exceptions=None):
+    async def power_supply(
+        self, supply_on: bool, in_transaction: bool = False,
+        exceptions: bool | None = None
+    ) -> dali.command.Response[Any] | None:
         """
         TODO
         """
@@ -269,7 +294,11 @@ class hid:
             if not in_transaction:
                 self.transaction_lock.release()
 
-    async def run_sequence(self, seq, progress=None):
+    async def run_sequence(
+        self,
+        seq: dali.sequences.DALISequence[Any],
+        progress: Callable[[str | dali.sequences.progress], None] | None = None,
+    ) -> Any:
         """Deprecated alias for send(), which now accepts commands and sequences
         """
         warnings.warn(
@@ -279,7 +308,25 @@ class hid:
         )
         return await self.send(seq, progress=progress)
 
-    def _initialise_device(self):
+    async def _send_raw(
+        self, command: dali.command.Command
+    ) -> dali.command.Response[Any] | None:
+        """Transmit a single frame; implemented in a device-specific subclass.
+        """
+        raise NotImplementedError(
+            "'_send_raw()' needs to be implemented in a subclass"
+        )
+
+    async def _power_supply(
+        self, supply_on: bool
+    ) -> dali.command.Response[Any] | None:
+        """Switch the bus power supply; implemented in a subclass if supported.
+        """
+        raise NotImplementedError(
+            "'_power_supply()' needs to be implemented in a subclass"
+        )
+
+    def _initialise_device(self) -> None:
         """Send any device-specific initialisation commands
         """
         # Some devices may need to send initialisation commands and await
@@ -287,7 +334,7 @@ class hid:
         # they set self.connected once initialisation is complete
         self.connected.set()
 
-    def _shutdown_device(self):
+    def _shutdown_device(self) -> None:
         """Shut down everything that is waiting for the device
 
         The device has gone away.  Everything that is waiting for the
@@ -295,7 +342,9 @@ class hid:
         """
         pass
 
-    def _reader(self):
+    def _reader(self) -> None:
+        # The reader is only registered while the device file is open.
+        assert self._f is not None
         try:
             # No need to retry on InterruptedError since 3.5
             data = os.read(self._f, 64)
@@ -307,8 +356,9 @@ class hid:
             return
         self._handle_read(data)
 
-    def _handle_read(self, data):
+    def _handle_read(self, data: bytes) -> None:
         pass
+
 
 class tridonic(hid):
     # Commands sent to the interface
@@ -350,16 +400,16 @@ class tridonic(hid):
     # For _CMD_POWERSUPPLY, send in byte 1;
     _POWER_SUPPLY_OFF = 0x00
     _POWER_SUPPLY_ON = 0x01
-    _POWER_SUPPLY_TBD = 0xFF # APPLY?
+    _POWER_SUPPLY_TBD = 0xFF  # APPLY?
 
     # Responses received from the interface
     # Decodes to mode, response type, frame, interval, seq
     _resptmpl = struct.Struct(">BB4sHB55x")
     # length of the "useful part", without the trailing padding
     _resptmpl_useful_size = _resptmpl.size - 55
-    _MODE_INFO = 0x01 # Response to an init command
-    _MODE_OBSERVE = 0x11 # Other traffic observed on the bus
-    _MODE_RESPONSE = 0x12 # Response to a send command
+    _MODE_INFO = 0x01  # Response to an init command
+    _MODE_OBSERVE = 0x11  # Other traffic observed on the bus
+    _MODE_RESPONSE = 0x12  # Response to a send command
 
     # Response types
     _RESPONSE_NO_FRAME = 0x71
@@ -368,7 +418,7 @@ class tridonic(hid):
     _RESPONSE_FRAME_eDALI25 = 0x74
     _RESPONSE_FRAME_DSI = 0x75
     _RESPONSE_FRAME_DALI24 = 0x76
-    _RESPONSE_INFO = 0x77 # bus or framing error - see byte frame[3]
+    _RESPONSE_INFO = 0x77  # bus or framing error - see byte frame[3]
     _RESPONSE_FRAME_HELVAR17 = 0x78
 
     # Bus status in byte frame[3]
@@ -380,7 +430,7 @@ class tridonic(hid):
     _BUS_STATUS_DALI_MODE = 6
 
     @staticmethod
-    def _seqnum(i):
+    def _seqnum(i: int) -> Iterator[int]:
         """Sequence number generator
         """
         while True:
@@ -389,7 +439,7 @@ class tridonic(hid):
             if i > 0xff:
                 i = 1
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._log = self._log.getChild("tridonic")
 
@@ -399,29 +449,34 @@ class tridonic(hid):
 
         # Outstanding command events and message queues indexed by
         # sequence number
-        self._outstanding = {}
+        self._outstanding: dict[
+            int, tuple[asyncio.Event, list[bytes | str]]
+        ] = {}
 
         # Semaphore controlling number of outstanding commands
         self._command_semaphore = asyncio.BoundedSemaphore(2)
 
         # Bus watch task, event and message queue
-        self._bus_watch_task = None
+        self._bus_watch_task: asyncio.Task[None] | None = None
         self._bus_watch_data_available = asyncio.Event()
-        self._bus_watch_data = []
+        self._bus_watch_data: list[bytes] = []
 
-    def _raw_write(self, buf: bytes):
+    def _raw_write(self, buf: bytes) -> None:
         self._log.debug(f"_raw_write: {_hex(buf[0:self._cmdtmpl_useful_size])}")
+        # The device file is open whenever a command is transmitted.
+        assert self._f is not None
         os.write(self._f, buf)
 
-    def _initialise_device(self):
+    def _initialise_device(self) -> None:
         # Read firmware version; pick up the reply in _handle_read
         self._raw_write(self._cmd(
             tridonic._CMD_INIT, tridonic._CMD_INIT_READVERSION))
 
-    async def _power_supply(self, supply_on):
+    async def _power_supply(self, supply_on: bool) -> None:
         await self.connected.wait()
         async with self._command_semaphore:
-            data = self._cmd(self._CMD_POWERSUPPLY,
+            data = self._cmd(
+                self._CMD_POWERSUPPLY,
                 self._POWER_SUPPLY_ON if supply_on else self._POWER_SUPPLY_OFF)
 
             try:
@@ -434,7 +489,7 @@ class tridonic(hid):
                 raise CommunicationError
 
     @staticmethod
-    def _command_mode(frame):
+    def _command_mode(frame: dali.frame.Frame) -> int:
         if len(frame) == 8:
             return tridonic._SEND_MODE_DALI8
         if len(frame) == 16:
@@ -443,7 +498,9 @@ class tridonic(hid):
             return tridonic._SEND_MODE_DALI24
         raise UnsupportedFrameTypeError
 
-    async def _send_raw(self, command):
+    async def _send_raw(
+        self, command: dali.command.Command
+    ) -> dali.command.Response[Any] | None:
         frame = command.frame
         if len(frame) not in (16, 24):
             raise UnsupportedFrameTypeError
@@ -452,7 +509,7 @@ class tridonic(hid):
             seq = next(self._cmd_seq)
             self._log.debug(f"Sending with {seq=:02x}")
             event = asyncio.Event()
-            messages = []
+            messages: list[bytes | str] = []
             # If seq is in self._outstanding this means we've wrapped
             # around the whole sequence number space with an event
             # still outstanding: clearly a bug!
@@ -473,7 +530,7 @@ class tridonic(hid):
                 raise CommunicationError
 
             outstanding_transmissions = 2 if command.sendtwice else 1
-            response = None
+            response: dali.frame.BackwardFrame | str | None = None
             while outstanding_transmissions or response is None:
                 self._log.debug(f"_send_raw waiting for {outstanding_transmissions=} "
                                 f"{response=!s}")
@@ -492,20 +549,28 @@ class tridonic(hid):
                     # of processing our command.
                     self._log.debug("processing queued fail on receive")
                     raise CommunicationError
+                if TYPE_CHECKING:
+                    # Only the "fail" sentinel is a str; every other queued
+                    # message is a raw response packet.
+                    assert isinstance(message, bytes)
 
                 # The message mode is guaranteed to be _MODE_RESPONSE
                 mode, rtype, frame, interval, seq = self._resptmpl.unpack(
                     message)
-                self._log.debug(f"_send_raw got message: {mode=:02x} {rtype=:02x} frame={_hex(frame)} {interval=:04x} {seq=:02x}")
+                self._log.debug(
+                    f"_send_raw got message: {mode=:02x} {rtype=:02x} "
+                    f"frame={_hex(frame)} {interval=:04x} {seq=:02x}")
                 if rtype in (self._RESPONSE_FRAME_DALI16,
                              self._RESPONSE_FRAME_DALI24):
                     # XXX check the frame contents?
                     outstanding_transmissions -= 1
-                    self._log.debug(f"_send_raw rtype DALI16 or DALI24, new {outstanding_transmissions=}")
+                    self._log.debug(
+                        f"_send_raw rtype DALI16 or DALI24, new "
+                        f"{outstanding_transmissions=}")
                 elif rtype == self._RESPONSE_FRAME_DALI8:
                     response = dali.frame.BackwardFrame(frame)
-                elif rtype == self._RESPONSE_INFO \
-                     and frame[3] == self._BUS_STATUS_FRAMING_ERROR:
+                elif (rtype == self._RESPONSE_INFO
+                      and frame[3] == self._BUS_STATUS_FRAMING_ERROR):
                     response = dali.frame.BackwardFrameError(255)
                 elif rtype == self._RESPONSE_NO_FRAME:
                     response = "no"
@@ -517,9 +582,14 @@ class tridonic(hid):
                 # Construct response and return it
                 if response == "no":
                     return command.response(None)
+                if TYPE_CHECKING:
+                    # The only str value is the "no" sentinel handled above.
+                    assert not isinstance(response, str)
                 return command.response(response)
+        # No response was expected, or the context manager swallowed an error.
+        return None
 
-    async def _bus_watch(self):
+    async def _bus_watch(self) -> None:
         # Why is this a task, and not just run from _handle_read()?
         # It's so that when we see a forward frame on the bus that
         # didn't originate with us, we can apply a timeout after which
@@ -528,7 +598,7 @@ class tridonic(hid):
         # assume there wasn't one.
 
         # Command awaiting repeat or reply
-        current_command = None
+        current_command: dali.command.Command | None = None
         devicetype = 0
 
         while True:
@@ -558,15 +628,16 @@ class tridonic(hid):
                     self._log.warning("bus_watch: unexpected packet mode, ignoring")
                     continue
                 if rtype == self._RESPONSE_FRAME_DALI16:
-                    frame = dali.frame.ForwardFrame(16, raw_frame)
+                    frame: dali.frame.Frame | str = dali.frame.ForwardFrame(
+                        16, raw_frame)
                 elif rtype == self._RESPONSE_FRAME_DALI24:
                     frame = dali.frame.ForwardFrame(24, raw_frame)
                 elif rtype == self._RESPONSE_FRAME_DALI8:
                     frame = dali.frame.BackwardFrame(raw_frame)
                 elif rtype == self._RESPONSE_NO_FRAME:
                     frame = "no"
-                elif rtype == self._RESPONSE_INFO \
-                     and message[5] == self._BUS_STATUS_FRAMING_ERROR:
+                elif (rtype == self._RESPONSE_INFO
+                      and message[5] == self._BUS_STATUS_FRAMING_ERROR):
                     frame = dali.frame.BackwardFrameError(255)
                 else:
                     # Probably a bus status message other than framing error
@@ -594,7 +665,9 @@ class tridonic(hid):
                             current_command = None
                             continue
                         else:
-                            self._log.warning("Failed config command (second frame didn't match): %s", current_command)
+                            self._log.warning(
+                                "Failed config command (second frame didn't "
+                                "match): %s", current_command)
                             self.bus_traffic._invoke(current_command, None, True)
                             current_command = None
                             # Fall through to continue processing frame
@@ -605,27 +678,32 @@ class tridonic(hid):
                         self.bus_traffic._invoke(current_command, None, True)
                         current_command = None
                     elif frame == "no":
-                        self._log.warning("No frame in response to a sendtwice command: %s", current_command)
+                        self._log.warning(
+                            "No frame in response to a sendtwice command: %s",
+                            current_command)
                         self.bus_traffic._invoke(current_command, None, True)
                         current_command = None
                         continue
                     else:
-                        self._log.error("Unexpected response waiting for retransmit of config command, frame = %s", frame)
+                        self._log.error(
+                            "Unexpected response waiting for retransmit of "
+                            "config command, frame = %s", frame)
                 elif current_command.response:
                     # We are waiting for a response
+                    response_cls = current_command.response
                     if timeout or frame == "no":
                         # The response is "No".
                         self._log.debug("Command %s response \'No\'", current_command)
                         self.bus_traffic._invoke(
-                            current_command, current_command.response(None), False)
+                            current_command, response_cls(None), False)
                         current_command = None
                         continue
                     elif isinstance(frame, dali.frame.BackwardFrame):
                         # There's a response
                         self._log.debug("Command %s response %s",
-                                        current_command, current_command.response(frame))
+                                        current_command, response_cls(frame))
                         self.bus_traffic._invoke(
-                            current_command, current_command.response(frame), False)
+                            current_command, response_cls(frame), False)
                         current_command = None
                         continue
                     else:
@@ -634,18 +712,21 @@ class tridonic(hid):
                         self._log.debug("Command %s response \'No\' (on new frame)",
                                         current_command)
                         self.bus_traffic._invoke(
-                            current_command, current_command.response(None), False)
+                            current_command, response_cls(None), False)
                         current_command = None
 
             # If we reach here, there is no current_command and there
             # may still be a frame to process.
-            assert current_command == None
+            assert current_command is None
             if timeout:
                 pass
             elif isinstance(frame, dali.frame.ForwardFrame):
                 command = dali.command.from_frame(
                     frame, devicetype=devicetype,
                     dev_inst_map=self.dev_inst_map)
+                if TYPE_CHECKING:
+                    # from_frame always returns a Command for a forward frame.
+                    assert command is not None
                 devicetype = 0
                 if command.sendtwice or command.response:
                     # We need more information.  Stash the command and wait.
@@ -661,7 +742,7 @@ class tridonic(hid):
                 self._log.debug("Unexpected backward frame %s", frame)
             # self._log.debug("End of loop")
 
-    def _handle_read(self, data):
+    def _handle_read(self, data: bytes) -> None:
         self._log.debug("_handle_read %s", _hex(data[0:self._resptmpl_useful_size]))
         if data[0] == self._MODE_INFO:
             # Response to initialisation command
@@ -704,7 +785,7 @@ class tridonic(hid):
         else:
             self._log.debug("Unknown response mode %x", data[0])
 
-    def _shutdown_device(self):
+    def _shutdown_device(self) -> None:
         # All outstanding commands need to be woken up and told they've failed
         for event, messages in self._outstanding.values():
             messages.append("fail")
@@ -721,8 +802,9 @@ class tridonic(hid):
         self.serial = None
 
     @staticmethod
-    def _cmd(cmd, serial, ctrl=0, mode=0, frame=bytes(), dtr0=0, prio=0,
-             devtype=0):
+    def _cmd(cmd: int, serial: int, ctrl: int = 0, mode: int = 0,
+             frame: bytes = bytes(), dtr0: int = 0, prio: int = 0,
+             devtype: int = 0) -> bytes:
         """Return 64 bytes for the specified command
         """
         return tridonic._cmdtmpl.pack(
@@ -747,14 +829,16 @@ class hasseb(hid):
     _OK = 2
     _INVALID_ANSWER = 3
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._log = self._log.getChild("hasseb")
         self._command_lock = asyncio.Lock()
         self._response_available = asyncio.Event()
-        self._response = None
+        self._response: bytes | str | None = None
 
-    async def _send_raw(self, command):
+    async def _send_raw(
+        self, command: dali.command.Command
+    ) -> dali.command.Response[Any] | None:
         frame = command.frame
         if len(frame) != 16:
             raise UnsupportedFrameTypeError
@@ -762,12 +846,14 @@ class hasseb(hid):
         async with self._command_lock:
             times = 2 if command.sendtwice else 1
             for rep in range(times):
-                self._raw_write(frame.pack_len(2))
+                # Latent bug: hasseb defines no _raw_write (only tridonic
+                # does) so this raises AttributeError at runtime. Preserved.
+                self._raw_write(frame.pack_len(2))  # type: ignore[attr-defined]
             # Earlier commands may have left a response available that
             # we need to ignore.  We're only interested in responses
             # that become available in the future.
             self._response_available.clear()
-            response = None
+            response: dali.command.Response[Any] | None = None
             if command.response:
                 # The hasseb device appears to have an internal table
                 # of which commands require responses.  If a command
@@ -779,22 +865,33 @@ class hasseb(hid):
                 # for example.
                 await self._response_available.wait()
                 self._response_available.clear()
+                if TYPE_CHECKING:
+                    # A reply is always set before the event fires: either the
+                    # two-byte packet from _handle_read or the "fail" sentinel.
+                    assert self._response is not None
                 if self._response == "fail":
                     raise CommunicationError
                 elif self._response[0] == self._NO_ANSWER:
                     response = command.response(None)
                 elif self._response[0] == self._OK:
+                    if TYPE_CHECKING:
+                        # A non-"fail" reply is the two-byte status packet.
+                        assert isinstance(self._response, bytes)
                     response = command.response(dali.frame.BackwardFrame(self._response[1]))
                 elif self._response[0] == self._INVALID_ANSWER:
-                    response = command._response(dali.frame.BackwardFrameError(
-                        self._response[1]))
+                    if TYPE_CHECKING:
+                        assert isinstance(self._response, bytes)
+                    # Latent bug: 'command._response' is not a Command attribute
+                    # (should be 'command.response'); raises AttributeError.
+                    response = command._response(  # type: ignore[attr-defined]
+                        dali.frame.BackwardFrameError(self._response[1]))
                 else:
                     self._log.debug("Unknown response code %x", self._response[0])
 
             self.bus_traffic._invoke(command, response, False)
             return response
 
-    def _handle_read(self, data):
+    def _handle_read(self, data: bytes) -> None:
         # Response should be two bytes.  First byte is status, second
         # byte is optional response data.  The hasseb appears to send
         # "NO DATA AVAILABLE" reports continuously when it is idle.
@@ -802,7 +899,7 @@ class hasseb(hid):
             self._response = data
             self._response_available.set()
 
-    def _shutdown_device(self):
+    def _shutdown_device(self) -> None:
         # If there's a command in progress, tell it it's failed
         self._response = "fail"
         self._response_available.set()
