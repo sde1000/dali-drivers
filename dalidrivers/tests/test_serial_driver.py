@@ -9,7 +9,8 @@ import pytest
 from dali.address import DeviceShort, GearShort, InstanceNumber
 from dali.command import NumericResponse
 from dali.device.general import QueryInstanceType
-from dalidrivers.misc.serial import _DALI_FRAMING_ERROR, DriverLubaRs232
+from dali.exceptions import MissingResponse
+from dalidrivers.typed.serial import _DALI_FRAMING_ERROR, DriverLubaRs232
 from dali.gear.general import QueryActualLevel
 
 
@@ -17,8 +18,8 @@ from dali.gear.general import QueryActualLevel
 async def test_timed_out_query_reports_missing_value():
     """A query that times out must return the command's own response type.
 
-    A bare Response(None) passes check_bad_rsp while its value is None, which
-    leaked into control-device autodiscovery and crashed on int(None).
+    A bare Response(None) is reported as missing, so autodiscovery no longer
+    leaks a None value that crashed on int(None).
     """
     driver = DriverLubaRs232("luba232:/dev/ttyACM0")
     driver._connected.set()
@@ -33,7 +34,10 @@ async def test_timed_out_query_reports_missing_value():
     )
 
     assert isinstance(response, NumericResponse)
+    assert response.missing
     assert not response.valid
+    with pytest.raises(MissingResponse):
+        _ = response.value
 
 
 @pytest.mark.asyncio
@@ -67,7 +71,7 @@ def _connecting_driver(monkeypatch, info_side_effect):
     protocol.send_device_settings = AsyncMock()
     protocol.reset_luba_response = MagicMock()
     monkeypatch.setattr(
-        "dalidrivers.misc.serial.serialx.create_serial_connection",
+        "dalidrivers.typed.serial.serialx.create_serial_connection",
         AsyncMock(return_value=(MagicMock(), protocol)),
     )
     return driver, protocol
@@ -157,7 +161,7 @@ async def test_connect_reopens_the_port_after_a_lost_transport(monkeypatch):
     replacement.send_device_info_query = AsyncMock()
     replacement.send_device_settings = AsyncMock()
     monkeypatch.setattr(
-        "dalidrivers.misc.serial.serialx.create_serial_connection",
+        "dalidrivers.typed.serial.serialx.create_serial_connection",
         AsyncMock(return_value=(MagicMock(), replacement)),
     )
 

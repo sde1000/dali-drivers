@@ -16,12 +16,13 @@ You should have received a copy of the GNU Lesser General Public License along w
 If not, see <https://www.gnu.org/licenses/>.
 """
 import logging
+from typing import Any
 
-_LOG = logging.getLogger(f"dali")
+_LOG = logging.getLogger("dali")
 _logging_trace_created = False
 
 
-def add_logging_level(level_name: str, level_num: int):
+def add_logging_level(level_name: str, level_num: int) -> None:
     """
     Original source: https://stackoverflow.com/a/35804945
 
@@ -46,11 +47,15 @@ def add_logging_level(level_name: str, level_num: int):
     # This method was inspired by the answers to Stack Overflow post
     # http://stackoverflow.com/q/2183233/2988730, especially
     # http://stackoverflow.com/a/13638084/2988730
-    def logForLevel(self, message, *args, **kwargs):
+    # *args/**kwargs forward verbatim to the stdlib logging call, whose keyword
+    # parameters are heterogeneous, so they are typed Any here.
+    def logForLevel(
+        self: logging.Logger, message: object, *args: Any, **kwargs: Any
+    ) -> None:
         if self.isEnabledFor(level_num):
             self._log(level_num, message, args, **kwargs)
 
-    def logToRoot(message, *args, **kwargs):
+    def logToRoot(message: object, *args: Any, **kwargs: Any) -> None:
         logging.log(level_num, message, *args, **kwargs)
 
     logging.addLevelName(level_num, level_name)

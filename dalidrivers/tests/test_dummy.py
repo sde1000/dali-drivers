@@ -23,7 +23,7 @@ from typing import NamedTuple
 import py
 import pytest
 
-from dalidrivers.misc.serial import DriverSerialBase, DriverLubaRs232, DriverSCIRS232, drivers_map
+from dalidrivers.typed.serial import DriverSerialBase, DriverLubaRs232, DriverSCIRS232, drivers_map
 from dalidrivers.tests.fakes_serial import DriverSerialDummy
 from dali import address, gear
 from dali.gear.colour import QueryColourStatus
