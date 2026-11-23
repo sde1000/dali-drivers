@@ -6,11 +6,21 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from dali.address import DeviceShort, GearShort, InstanceNumber
+from dali import firmware
+from dali.address import (
+    DeviceShort,
+    FirmwareBroadcast,
+    GearShort,
+    InstanceNumber,
+)
 from dali.command import NumericResponse
 from dali.device.general import QueryInstanceType
 from dali.exceptions import MissingResponse
-from dalidrivers.typed.serial import _DALI_FRAMING_ERROR, DriverLubaRs232
+from dalidrivers.typed.serial import (
+    _DALI_FRAMING_ERROR,
+    DistributorQueue,
+    DriverLubaRs232,
+)
 from dali.gear.general import QueryActualLevel
 
 
@@ -260,3 +270,107 @@ async def test_framing_error_query_returns_error_response():
 
     assert response.raw_value is not None
     assert response.raw_value.error is True
+
+
+async def _transmit(cmd):
+    """Send a command through a faked transport and return the bytes written."""
+    protocol = DriverLubaRs232.LubaProtocol()
+    protocol.transport = MagicMock()
+    protocol.rx_idle.set()
+    protocol._queue_tx_conf.put_nowait(
+        protocol.LubaMsgTxConf(tx_id=1, message=cmd)
+    )
+    await protocol.send_dali_command(cmd)
+    protocol.transport.write.assert_called_once()
+    return list(protocol.transport.write.call_args[0][0])
+
+
+def _luba_event(dali_bytes):
+    """Build a LUBA 'DALI frame received' event message."""
+    payload = [
+        0x00, 0x01,                        # Time tick
+        0x00,                              # DALI line
+        (2 << 6) | (8 * len(dali_bytes)),  # Event type 2, frame length in bits
+        *dali_bytes,
+    ]
+    body = [
+        DriverLubaRs232.LubaCmd.EVENT_MESSAGE.value,
+        len(payload),
+        *payload,
+    ]
+    return bytes([0x59, *body, reduce(xor, body)])
+
+
+@pytest.mark.asyncio
+async def test_send_32_bit_frame_fills_the_whole_data_field():
+    """A firmware transfer frame uses all four LUBA data bytes."""
+    written = await _transmit(
+        firmware.StartFirmwareTransfer(FirmwareBroadcast()))
+
+    assert written[0] == 0x59
+    assert written[1] == DriverLubaRs232.LubaCmd.ADD_DALI_FRAME_TO_TX_CMD.value
+    assert written[2] == 7  # Payload length is unchanged
+    assert written[4] == 32  # Number of bits in the DALI frame
+    assert written[6:10] == [0xFE, 0xFB, 0x00, 0x00]
+    assert written[-1] == reduce(xor, written[1:-1])
+    assert len(written) == 11
+
+
+@pytest.mark.asyncio
+async def test_send_32_bit_block_data():
+    """Block payload bytes reach the wire unchanged."""
+    written = await _transmit(firmware.TransferBlockData(0xAABBCC))
+
+    assert written[4] == 32
+    assert written[6:10] == [0xBD, 0xAA, 0xBB, 0xCC]
+
+
+@pytest.mark.asyncio
+async def test_send_16_bit_frame_is_still_padded():
+    """Shorter frames stay left-aligned with the data field zero-padded."""
+    written = await _transmit(QueryActualLevel(GearShort(0)))
+
+    assert written[2] == 7
+    assert written[4] == 16
+    assert written[6:10] == [0x01, 0xA0, 0x00, 0x00]
+    assert len(written) == 11
+
+
+@pytest.mark.asyncio
+async def test_send_rejects_frames_the_data_field_cannot_hold():
+    """An 8-bit frame is not a forward frame the interface can transmit."""
+    protocol = DriverLubaRs232.LubaProtocol()
+    protocol.transport = MagicMock()
+    protocol.rx_idle.set()
+    cmd = MagicMock()
+    cmd.frame.as_byte_sequence = [0xFF]
+
+    with pytest.raises(ValueError, match="16, 24 or 32 bit"):
+        await protocol.send_dali_command(cmd)
+
+    protocol.transport.write.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_received_32_bit_frame_decodes_to_a_firmware_command():
+    """A 32-bit frame observed on the bus is decoded, not dropped."""
+    protocol = DriverLubaRs232.LubaProtocol()
+    rx_queue = DistributorQueue(protocol.queue_rx_dali)
+
+    protocol.data_received(_luba_event([0x0A, 0xFB, 0x07, 0x00]))
+
+    received = await asyncio.wait_for(rx_queue.get(), timeout=1)
+    assert isinstance(received, firmware.QueryFirmwareUpdateReceiverReady)
+    assert received.destination.address == 5
+
+
+@pytest.mark.asyncio
+async def test_received_24_bit_frame_still_decodes():
+    """Accepting 32-bit frames did not disturb 24-bit decoding."""
+    protocol = DriverLubaRs232.LubaProtocol()
+    rx_queue = DistributorQueue(protocol.queue_rx_dali)
+
+    protocol.data_received(_luba_event([0xFF, 0xFE, 0x00]))
+
+    received = await asyncio.wait_for(rx_queue.get(), timeout=1)
+    assert len(received.frame) == 24

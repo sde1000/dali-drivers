@@ -16,7 +16,9 @@ from dali.sequences import sleep as seq_sleep
 from dali.sequences import progress as seq_progress
 import dali.frame
 
-# dali.command and dali.gear are required for the bus traffic callback
+# dali.command, dali.gear and dali.firmware are required for the bus traffic
+# callback
+import dali.firmware  # noqa: F401
 import dali.command
 import dali.gear
 from dali.gear.general import EnableDeviceType
@@ -233,7 +235,7 @@ class hid:
                     command_sent = False
                     while not command_sent:
                         try:
-                            if cmd.devicetype != 0:
+                            if cmd.devicetype is not None:
                                 await self._send_raw(
                                     EnableDeviceType(cmd.devicetype)
                                 )
@@ -346,6 +348,7 @@ class tridonic(hid):
     _SEND_MODE_DSI = 5
     _SEND_MODE_DALI24 = 6
     _SEND_MODE_HELVAR17 = 8
+    _SEND_MODE_DALI32 = 0x0e
 
     # For _CMD_POWERSUPPLY, send in byte 1;
     _POWER_SUPPLY_OFF = 0x00
@@ -370,6 +373,16 @@ class tridonic(hid):
     _RESPONSE_FRAME_DALI24 = 0x76
     _RESPONSE_INFO = 0x77 # bus or framing error - see byte frame[3]
     _RESPONSE_FRAME_HELVAR17 = 0x78
+
+    # 32-bit frames (IEC 62386-105 firmware transfer) are reported with
+    # response type 0xfe according to Tridonic's own driver, which does not
+    # follow the 0x70 | send-mode pattern that holds for every other frame
+    # type.  Tridonic never implemented the receive path, so 0x7e - the value
+    # the pattern predicts - may be what the device actually sends.  Accept
+    # both: neither value is used for anything else.
+    _RESPONSE_FRAME_DALI32 = 0xfe
+    _RESPONSE_FRAME_DALI32_ALT = 0x7e
+    _RESPONSE_FRAMES_DALI32 = (_RESPONSE_FRAME_DALI32, _RESPONSE_FRAME_DALI32_ALT)
 
     # Bus status in byte frame[3]
     _BUS_STATUS_CHECKSUM = 1
@@ -441,11 +454,13 @@ class tridonic(hid):
             return tridonic._SEND_MODE_DALI16
         if len(frame) == 24:
             return tridonic._SEND_MODE_DALI24
+        if len(frame) == 32:
+            return tridonic._SEND_MODE_DALI32
         raise UnsupportedFrameTypeError
 
     async def _send_raw(self, command):
         frame = command.frame
-        if len(frame) not in (16, 24):
+        if len(frame) not in (16, 24, 32):
             raise UnsupportedFrameTypeError
         await self.connected.wait()
         async with self._command_semaphore:
@@ -498,10 +513,11 @@ class tridonic(hid):
                     message)
                 self._log.debug(f"_send_raw got message: {mode=:02x} {rtype=:02x} frame={_hex(frame)} {interval=:04x} {seq=:02x}")
                 if rtype in (self._RESPONSE_FRAME_DALI16,
-                             self._RESPONSE_FRAME_DALI24):
+                             self._RESPONSE_FRAME_DALI24,
+                             *self._RESPONSE_FRAMES_DALI32):
                     # XXX check the frame contents?
                     outstanding_transmissions -= 1
-                    self._log.debug(f"_send_raw rtype DALI16 or DALI24, new {outstanding_transmissions=}")
+                    self._log.debug(f"_send_raw rtype DALI16, DALI24 or DALI32, new {outstanding_transmissions=}")
                 elif rtype == self._RESPONSE_FRAME_DALI8:
                     response = dali.frame.BackwardFrame(frame)
                 elif rtype == self._RESPONSE_INFO \
@@ -529,7 +545,7 @@ class tridonic(hid):
 
         # Command awaiting repeat or reply
         current_command = None
-        devicetype = 0
+        devicetype = None
 
         while True:
             # Wait for data
@@ -561,6 +577,8 @@ class tridonic(hid):
                     frame = dali.frame.ForwardFrame(16, raw_frame)
                 elif rtype == self._RESPONSE_FRAME_DALI24:
                     frame = dali.frame.ForwardFrame(24, raw_frame)
+                elif rtype in self._RESPONSE_FRAMES_DALI32:
+                    frame = dali.frame.ForwardFrame(32, raw_frame)
                 elif rtype == self._RESPONSE_FRAME_DALI8:
                     frame = dali.frame.BackwardFrame(raw_frame)
                 elif rtype == self._RESPONSE_NO_FRAME:
@@ -646,7 +664,7 @@ class tridonic(hid):
                 command = dali.command.from_frame(
                     frame, devicetype=devicetype,
                     dev_inst_map=self.dev_inst_map)
-                devicetype = 0
+                devicetype = None
                 if command.sendtwice or command.response:
                     # We need more information.  Stash the command and wait.
                     current_command = command
