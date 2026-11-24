@@ -26,6 +26,8 @@ import dali.command
 import dali.gear
 from dali.gear.general import EnableDeviceType
 
+from dalidrivers.typed._queue import DistributorQueue
+
 
 def _hex(b: bytes) -> str:
     return ''.join("%02X" % x for x in b)
@@ -84,8 +86,19 @@ class hid:
         self._reconnect_count = 0
         self._reconnect_task: asyncio.Task[None] | None = None
         self._glob = glob
-        self.dev_inst_map = dev_inst_map
+        if dev_inst_map is None:
+            dev_inst_map = DeviceInstanceTypeMapper()
+        self.dev_inst_map: DeviceInstanceTypeMapper = dev_inst_map
         self._f: int | None = None
+
+        # The exception from the most recent _open() attempt, so an async
+        # connect() can fail fast instead of waiting out the reconnect loop.
+        self._open_error: Exception | None = None
+
+        # Lazily created when new_dali_rx_queue() is first called: a parent
+        # fan-out queue fed from the bus_traffic callback, and its handle.
+        self._rx_queue_parent: DistributorQueue | None = None
+        self._rx_traffic_handle: _callback._callback_handle | None = None
 
         # Should the send() method raise an exception if there is a
         # problem communicating with the underlying device, or should
@@ -122,20 +135,49 @@ class hid:
         self.firmware_version: str | None = None
         self.serial: str | None = None
 
-    def connect(self) -> bool:
-        """Attempt to connect to the device.
+    async def connect(self, *, scan_dev_inst: bool = False,
+                      timeout: float = 10.0) -> None:
+        """Open the device and wait until it is ready for use.
 
-        Attempts to open the device.  If this fails, schedules a
-        reconnection attempt.
+        This mirrors the serial driver's ``connect()`` so both drivers expose
+        one uniform async interface: open the device, block until the
+        device-specific handshake has completed, and optionally scan the bus
+        for control-device instance types.
+
+        A missing or inaccessible device node fails fast with the underlying
+        OSError; a device that opens but never completes its handshake raises
+        TimeoutError after ``timeout`` seconds.
+
+        :param scan_dev_inst: Scan the DALI bus for control devices and
+        populate ``dev_inst_map`` with their instance types.
+        :param timeout: Seconds to wait for the handshake to complete.
+        """
+        self._open_error = None
+        if not self._open() and self._open_error is not None:
+            # The device node is missing or not permitted. Cancel the
+            # reconnection loop _open() scheduled and report the failure.
+            if self._reconnect_task is not None:
+                self._reconnect_task.cancel()
+                self._reconnect_task = None
+            raise self._open_error
+        try:
+            await asyncio.wait_for(self.connected.wait(), timeout)
+        except TimeoutError:
+            self.disconnect()
+            raise
+        if scan_dev_inst:
+            await self.send(self.dev_inst_map.autodiscover())
+
+    def _open(self) -> bool:
+        """Attempt to open the device file.
+
+        If opening fails, schedules a reconnection attempt and records the
+        exception in ``self._open_error``.
 
         Returns True if opening the device file succeded immediately,
         False otherwise.  NB you must still await connected.wait()
         before using the device, because there may be further
         initialisation for the driver to perform.
-
-        If your application is (for example) a command-line script
-        that wants to report failure as early as possible, you could
-        do so if this returns False.
         """
         if self._f:
             return True
@@ -144,7 +186,7 @@ class hid:
             path = glob.glob(self._path)
         else:
             path = [self._path]
-        ex = None
+        ex: Exception | None = None
         if path:
             try:
                 if self._glob:
@@ -155,11 +197,14 @@ class hid:
                 ex = e
         else:
             self._log.debug("path %s not found", self._path)
+            ex = FileNotFoundError(self._path)
         if not self._f:
             # It didn't work.  Schedule a reconnection attempt if we can.
+            self._open_error = ex
             self._log.debug("hid failed to open %s (%s) - waiting to try again", self._path, ex)
             self._reconnect_task = asyncio.create_task(self._reconnect())
             return False
+        self._open_error = None
         self._reconnect_count = 0
         self._initialise_device()
         self._log.debug("hid opened %s", path[0])
@@ -178,7 +223,7 @@ class hid:
             return
         await asyncio.sleep(self._reconnect_interval)
         self._reconnect_task = None
-        self.connect()
+        self._open()
 
     def disconnect(self, reconnect: bool = False) -> None:
         self._log.debug("disconnecting")
@@ -194,6 +239,48 @@ class hid:
         self.connection_status_callback._invoke("disconnected")
         if reconnect:
             self._reconnect_task = asyncio.ensure_future(self._reconnect())
+
+    def close(self) -> None:
+        """Close the device for good, mirroring the serial driver's close().
+
+        Unlike ``disconnect()`` this does not schedule a reconnection and also
+        tears down the received-traffic fan-out queue.
+        """
+        if self._rx_traffic_handle is not None:
+            self._rx_traffic_handle.unregister()
+            self._rx_traffic_handle = None
+        self._rx_queue_parent = None
+        self.disconnect()
+
+    @property
+    def is_connected(self) -> bool:
+        """True while the device is open and its handshake has completed."""
+        return self._f is not None and self.connected.is_set()
+
+    def new_dali_rx_queue(self) -> DistributorQueue:
+        """Return a queue of DALI commands observed on the bus.
+
+        Each call returns an independent child queue. The first call starts
+        forwarding the ``bus_traffic`` callback's commands into the fan-out;
+        responses to the driver's own queries are not included (``send()``
+        returns those to the caller).
+        """
+        if self._rx_queue_parent is None:
+            self._rx_queue_parent = DistributorQueue()
+            self._rx_traffic_handle = self.bus_traffic.register(
+                self._distribute_bus_traffic
+            )
+        return DistributorQueue(self._rx_queue_parent)
+
+    def _distribute_bus_traffic(
+        self,
+        driver: hid,
+        command: dali.command.Command,
+        response: Any,
+        config_command_error: bool,
+    ) -> None:
+        if self._rx_queue_parent is not None:
+            self._rx_queue_parent.distribute(command)
 
     async def send(
         self,

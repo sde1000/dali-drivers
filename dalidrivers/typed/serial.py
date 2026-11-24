@@ -251,6 +251,21 @@ class DriverSerialBase:
         """
         await self._connected.wait()
 
+    def close(self) -> None:
+        """
+        Close the underlying transport and mark the driver disconnected.
+
+        Provides one uniform teardown call across the typed drivers, so
+        callers do not need to reach into the transport.
+
+        :return: None
+        """
+        transport = getattr(self, "_transport", None)
+        if transport is not None:
+            transport.close()
+            self._transport = None
+        self._connected.clear()
+
     async def _send_frame(
         self, cmd: command.Command, *, priority: int = 1
     ) -> Optional[command.Response[Any]]:
