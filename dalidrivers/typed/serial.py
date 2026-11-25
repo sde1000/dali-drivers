@@ -40,6 +40,7 @@ from urllib.parse import ParseResult, urlparse, urlunparse
 
 import serialx
 
+import dali.firmware  # noqa: F401
 import dali.gear
 from dali import command, frame, gear, sequences
 from dalidrivers.typed import trace_logging  # noqa: F401
@@ -651,9 +652,11 @@ class DriverLubaRs232(DriverSerialBase):
             self, tx: command.Command, priority: int = 1
         ) -> int:
             """
-            Sends a variable length DALI command (16 or 24 bits), waiting
+            Sends a variable length DALI command (16, 24 or 32 bits), waiting
             until the LUBA device confirms it has sent the message before
             returning the frame ID.
+
+            32-bit frames are used for firmware transfer; see dali.firmware.
 
             :param tx: A single DALI command to send
             :param priority: IEC 62386-101 Table 22 transmit priority (1..5)
@@ -663,12 +666,17 @@ class DriverLubaRs232(DriverSerialBase):
             await self.rx_idle.wait()
 
             dali_ints = tx.frame.as_byte_sequence
-            if not len(dali_ints) in (2, 3):
+            if not len(dali_ints) in (2, 3, 4):
                 raise ValueError(
-                    f"Only works with 16 or 24 bit messages, not {8 * len(dali_ints)}"
+                    "Only works with 16, 24 or 32 bit messages, not "
+                    f"{8 * len(dali_ints)}"
                 )
             luba_mode = priority  # IEC 62386-101 Table 22 priority (1..5)
             luba_mode |= 0b10000000 if tx.sendtwice else 0  # "Send Twice" flag
+            # The LUBA data field is always four bytes. A shorter frame is
+            # left-aligned and the remaining bytes are padding; the bit count
+            # tells the device how much of the field to transmit.
+            data_ints = list(dali_ints) + [0] * (4 - len(dali_ints))
             tx_ints = [
                 0x59,  # ASCII 'Y'
                 DriverLubaRs232.LubaCmd.ADD_DALI_FRAME_TO_TX_CMD.value,  # LUBA Command
@@ -676,10 +684,7 @@ class DriverLubaRs232(DriverSerialBase):
                 0,  # DALI bus selector (RS232 device only has one bus)
                 8 * len(dali_ints),  # No. of bits in DALI frame
                 luba_mode,
-                dali_ints[0],  # Data, big-endian
-                dali_ints[1],  # Data, big-endian
-                0 if len(dali_ints) == 2 else dali_ints[2],  # Data, big-endian
-                0,  # Pad out to four bytes, to fit LUBA frame
+                *data_ints,  # Data, big-endian, padded to four bytes
                 None,  # Checksum
             ]
             # Fill in the checksum
@@ -1157,7 +1162,7 @@ class DriverLubaRs232(DriverSerialBase):
                     )
                     self._queue_rx_raw_dali.put_nowait(rx_dali[0])
                 else:
-                    # A 16 or 24-bit frame is an intercepted DALI command,
+                    # A 16, 24 or 32-bit frame is an intercepted DALI command,
                     # it can be deciphered into a Command object
                     dali_frame = frame.Frame(
                         bits=8 * len(rx_dali), data=rx_dali
