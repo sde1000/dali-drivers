@@ -9,6 +9,10 @@ Changes
   0471:0003), with 16-bit frames, backward-frame responses, optional bus
   power control, and offline HID protocol tests.
 - Move drivers with type annotations to dalidrivers.typed
+- Send ``EnableDeviceType`` for a command whose device type is 0,
+  fluorescent lamp control gear, which the drivers previously treated as
+  "send this command on its own".  Needs python-dali 1.0a3 or newer,
+  where ``Command.devicetype`` uses ``None`` for that instead.
 - The typed HID drivers (Tridonic DALI-USB, hasseb) gain a cross-platform
   hidapi backend (extra ``driver-hid``) so they also work on Windows and
   macOS; Linux keeps using hidraw directly by default.  Select with

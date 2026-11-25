@@ -374,7 +374,7 @@ class DriverSerialBase:
                         if progress:
                             progress(cmd)
                     else:
-                        if cmd.devicetype != 0:
+                        if cmd.devicetype is not None:
                             await self._send_frame(
                                 gear.general.EnableDeviceType(cmd.devicetype),
                                 priority=next_priority,
@@ -554,8 +554,8 @@ class DriverLubaRs232(DriverSerialBase):
             self._queue_tx_conf: asyncio.Queue[
                 DriverLubaRs232.LubaProtocol.LubaMsgTxConf
             ] = asyncio.Queue()
-            self._prev_rx_enable_dt = 0
-            self._prev_tx_enable_dt = 0
+            self._prev_rx_enable_dt: Optional[int] = None
+            self._prev_tx_enable_dt: Optional[int] = None
             self._tx_lock = asyncio.Lock()
             self._rx_state: Optional[DriverLubaRs232.LubaProtocol.ReadState] = None
             self.rx_idle = asyncio.Event()
@@ -1109,7 +1109,7 @@ class DriverLubaRs232(DriverSerialBase):
                 if isinstance(dali_command, dali.gear.general.EnableDeviceType):
                     self._prev_tx_enable_dt = dali_command.param
                 else:
-                    self._prev_tx_enable_dt = 0
+                    self._prev_tx_enable_dt = None
                 luba_tx_info = self.LubaMsgTxConf(
                     tx_id=tx_id, message=dali_command
                 )
@@ -1179,7 +1179,7 @@ class DriverLubaRs232(DriverSerialBase):
                     ):
                         self._prev_rx_enable_dt = dali_command.param
                     else:
-                        self._prev_rx_enable_dt = 0
+                        self._prev_rx_enable_dt = None
 
                     _LOG.debug(f"Adding DALI command to queue: {dali_command}")
                     self._queue_rx_dali.distribute(dali_command)
@@ -1643,8 +1643,8 @@ class DriverSCIRS232(DriverSerialBase):
             self._queue_rx_info: asyncio.Queue[
                 DriverSCIRS232.SCIRS232DeviceReply
             ] = asyncio.Queue()
-            self._prev_rx_enable_dt = 0
-            self._prev_tx_enable_dt = 0
+            self._prev_rx_enable_dt: Optional[int] = None
+            self._prev_tx_enable_dt: Optional[int] = None
             self._tx_lock = asyncio.Lock()
             self._rx_state: Optional[
                 DriverSCIRS232.SCIRS232Protocol.ReadState
@@ -2017,7 +2017,7 @@ class DriverSCIRS232(DriverSerialBase):
                 ):
                     self._prev_rx_enable_dt = dali_command.param
                 else:
-                    self._prev_rx_enable_dt = 0
+                    self._prev_rx_enable_dt = None
 
                 _LOG.debug(f"Adding DALI command to queue: {dali_command}")
                 self._queue_rx_dali.distribute(dali_command)
