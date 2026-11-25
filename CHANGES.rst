@@ -9,6 +9,11 @@ Changes
   0471:0003), with 16-bit frames, backward-frame responses, optional bus
   power control, and offline HID protocol tests.
 - Move drivers with type annotations to dalidrivers.typed
+- The typed HID drivers (Tridonic DALI-USB, hasseb) gain a cross-platform
+  hidapi backend (extra ``driver-hid``) so they also work on Windows and
+  macOS; Linux keeps using hidraw directly by default.  Select with
+  ``backend=``; ``path=None`` opens the first device with the driver's USB
+  IDs, and ``enumerate()`` lists connected devices.
 
 0.2
 ---

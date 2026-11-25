@@ -1,19 +1,27 @@
 # async device drivers for HID-based devices like Tridonic DALI-USB
 # and hasseb DALI Master
 
-# See examples/50-dali-hid.rules for udev rules that will make
-# suitably-named symlinks to the hidraw devices on Linux
+# Two I/O backends are available:
+#
+# - "hidraw" (default on Linux): opens a /dev/hidrawN node directly and
+#   needs no extra dependencies.  See examples/50-dali-hid.rules for udev
+#   rules that will make suitably-named symlinks to the hidraw devices.
+# - "hidapi" (default elsewhere, e.g. Windows and macOS): uses the hidapi
+#   package (pip install dali-drivers[driver-hid]) with a reader thread.
 
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import os
 import struct
 import logging
 import random
 import glob
+import sys
+import threading
 import warnings
-from typing import Any, Callable, Iterator, TYPE_CHECKING
+from typing import Any, Callable, Iterator, Literal, Protocol, TYPE_CHECKING
 from dali.device.helpers import DeviceInstanceTypeMapper
 from dali.exceptions import UnsupportedFrameTypeError, CommunicationError
 import dali.sequences
@@ -72,15 +80,188 @@ class _callback:
             asyncio.get_running_loop().call_soon(func, self._parent, *args)
 
 
+HidBackend = Literal["auto", "hidraw", "hidapi"]
+
+
+def _default_backend() -> Literal["hidraw", "hidapi"]:
+    """hidraw on Linux (no dependencies, works with the udev rules), else hidapi."""
+    return "hidraw" if sys.platform.startswith("linux") else "hidapi"
+
+
+def _import_hidapi() -> Any:
+    """Import the hidapi package's binding module.
+
+    On Linux the hidapi wheel ships two modules: ``hidraw`` (kernel hidraw
+    backend, same permissions as the hidraw backend of this driver) and
+    ``hid`` (libusb backend, which needs USB device permissions and detaches
+    the kernel driver).  Prefer ``hidraw`` there; elsewhere only ``hid``
+    exists.
+    """
+    if sys.platform.startswith("linux"):
+        try:
+            import hidraw  # type: ignore[import-not-found]
+            return hidraw
+        except ImportError:
+            pass
+    try:
+        import hid as hidapi  # type: ignore[import-not-found]
+    except ImportError as e:
+        raise ImportError(
+            "The hidapi backend needs the 'hidapi' package "
+            "(pip install dali-drivers[driver-hid])") from e
+    return hidapi
+
+
+class _Transport(Protocol):
+    """An open HID device delivering input reports to the event loop."""
+
+    def write(self, buf: bytes) -> None:
+        """Send one output report (without report ID); raise OSError on failure."""
+
+    def close(self) -> None:
+        """Stop delivering reports and release the device."""
+
+
+class _HidrawTransport:
+    """Linux hidraw device node, read via the event loop's add_reader()."""
+
+    def __init__(self, path: str, on_data: Callable[[bytes], None],
+                 on_lost: Callable[[], None]) -> None:
+        self._fd: int | None = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+        self._on_data = on_data
+        self._on_lost = on_lost
+        self._loop = asyncio.get_running_loop()
+        self._loop.add_reader(self._fd, self._reader)
+
+    def _reader(self) -> None:
+        # The reader is only registered while the device file is open.
+        assert self._fd is not None
+        try:
+            # No need to retry on InterruptedError since 3.5
+            data = os.read(self._fd, 64)
+        except OSError:
+            # Device has gone away
+            data = b''
+        if len(data) == 0:
+            self._on_lost()
+            return
+        self._on_data(data)
+
+    def write(self, buf: bytes) -> None:
+        assert self._fd is not None
+        os.write(self._fd, buf)
+
+    def close(self) -> None:
+        if self._fd is None:
+            return
+        self._loop.remove_reader(self._fd)
+        os.close(self._fd)
+        self._fd = None
+
+
+class _HidapiTransport:
+    """Cross-platform device opened through hidapi.
+
+    hidapi only offers blocking reads, so a daemon thread reads input reports
+    and hands them to the event loop with call_soon_threadsafe().  Writes are
+    issued directly from the event loop: they are a single short interrupt
+    transfer.
+    """
+
+    # How often the reader thread checks whether it should stop.
+    _READ_TIMEOUT_MS = 100
+
+    def __init__(self, hidapi: Any, path: bytes,
+                 on_data: Callable[[bytes], None],
+                 on_lost: Callable[[], None]) -> None:
+        self._dev = hidapi.device()
+        self._dev.open_path(path)
+        self._on_data = on_data
+        self._on_lost = on_lost
+        self._loop = asyncio.get_running_loop()
+        self._closed = False
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._read_loop, name=f"dali-hid-reader {path!r}",
+            daemon=True)
+        self._thread.start()
+
+    def _read_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                data = self._dev.read(64, self._READ_TIMEOUT_MS)
+            except (OSError, ValueError):
+                # Device has gone away (hidapi raises IOError/OSError on
+                # read errors, ValueError if the device was closed).
+                if not self._stop.is_set():
+                    self._loop.call_soon_threadsafe(self._deliver_lost)
+                return
+            if data:
+                self._loop.call_soon_threadsafe(self._deliver, bytes(data))
+
+    # These run on the event loop thread, as does close(), so checking
+    # _closed here drops reports that were queued just before closing.
+    def _deliver(self, data: bytes) -> None:
+        if not self._closed:
+            self._on_data(data)
+
+    def _deliver_lost(self) -> None:
+        if not self._closed:
+            self._on_lost()
+
+    def write(self, buf: bytes) -> None:
+        # hidapi expects the report ID as the first byte; these devices use
+        # unnumbered reports, i.e. report ID 0.  On Linux hidraw strips a
+        # leading zero, so the device sees the same bytes as with the
+        # hidraw transport; on Windows the ID byte is mandatory.
+        written = self._dev.write(b"\x00" + buf)
+        if written is not None and written < 0:
+            raise OSError(f"hidapi write failed: {self._dev.error()}")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        # hidapi devices must not be closed while another thread is in
+        # read(); the read timeout bounds how long this takes.
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=2 * self._READ_TIMEOUT_MS / 1000 + 1)
+        self._dev.close()
+
+
 class hid:
     """Shared code for drivers that work with HID devices
+
+    :param path: Device to open.  With the hidraw backend this is a device
+    node such as ``/dev/hidraw0`` (or a glob pattern if ``glob`` is true).
+    With the hidapi backend it is a hidapi device path as returned by
+    :meth:`enumerate` (matched with fnmatch if ``glob`` is true), or None to
+    open the first device with this driver's USB vendor and product ID.
+    :param backend: ``"hidraw"``, ``"hidapi"`` or ``"auto"`` (hidraw on
+    Linux, hidapi on other platforms).
     """
-    def __init__(self, path: str, reconnect_interval: float = 1,
+    # USB IDs of the supported device, used by the hidapi backend to find
+    # devices when no path is given.  Set by subclasses.
+    usb_vendor_id: int | None = None
+    usb_product_id: int | None = None
+
+    def __init__(self, path: str | None = None, reconnect_interval: float = 1,
                  reconnect_limit: int | None = None,
                  glob: bool = False,
-                 dev_inst_map: DeviceInstanceTypeMapper | None = None) -> None:
+                 dev_inst_map: DeviceInstanceTypeMapper | None = None,
+                 backend: HidBackend = "auto",
+                 hidapi_module: Any = None) -> None:
         self._log = logging.getLogger()
         self._path = path
+        if backend == "auto":
+            backend = _default_backend()
+        if backend not in ("hidraw", "hidapi"):
+            raise ValueError(f"unknown HID backend {backend!r}")
+        if backend == "hidraw" and path is None:
+            raise ValueError("the hidraw backend needs a device path")
+        self.backend: Literal["hidraw", "hidapi"] = backend
+        self._hidapi = hidapi_module
         self._reconnect_interval = reconnect_interval
         self._reconnect_limit = reconnect_limit
         self._reconnect_count = 0
@@ -89,7 +270,7 @@ class hid:
         if dev_inst_map is None:
             dev_inst_map = DeviceInstanceTypeMapper()
         self.dev_inst_map: DeviceInstanceTypeMapper = dev_inst_map
-        self._f: int | None = None
+        self._transport: _Transport | None = None
 
         # The exception from the most recent _open() attempt, so an async
         # connect() can fail fast instead of waiting out the reconnect loop.
@@ -168,37 +349,84 @@ class hid:
         if scan_dev_inst:
             await self.send(self.dev_inst_map.autodiscover())
 
+    @classmethod
+    def enumerate(cls, hidapi_module: Any = None) -> list[dict[str, Any]]:
+        """List connected devices of this type using hidapi.
+
+        Returns hidapi's device dicts (``path``, ``serial_number``,
+        ``product_string``, ...); pass ``d["path"]`` as the ``path`` argument
+        with the hidapi backend.  Works on all platforms hidapi supports.
+        """
+        hidapi = hidapi_module or _import_hidapi()
+        if cls.usb_vendor_id is None or cls.usb_product_id is None:
+            raise NotImplementedError(f"{cls.__name__} has no USB IDs")
+        return list(hidapi.enumerate(cls.usb_vendor_id, cls.usb_product_id))
+
+    def _candidate_paths(self) -> list[str | bytes]:
+        """Resolve the configured path to concrete paths for the backend."""
+        if self.backend == "hidraw":
+            assert self._path is not None
+            if self._glob:
+                return list(glob.glob(self._path))
+            return [self._path]
+        if self._hidapi is None:
+            self._hidapi = _import_hidapi()
+        if self._path is not None and not self._glob:
+            return [self._path.encode()]
+        devices = self.enumerate(self._hidapi)
+        found: list[bytes] = [d["path"] for d in devices]
+        if self._path is not None:
+            pattern = self._path
+            found = [p for p in found
+                     if fnmatch.fnmatchcase(p.decode(errors="replace"), pattern)]
+        return list[str | bytes](found)
+
+    def _open_transport(self, path: str | bytes) -> _Transport:
+        if self.backend == "hidraw":
+            assert isinstance(path, str)
+            return _HidrawTransport(path, self._handle_read, self._device_lost)
+        assert isinstance(path, bytes)
+        return _HidapiTransport(
+            self._hidapi, path, self._handle_read, self._device_lost)
+
     def _open(self) -> bool:
-        """Attempt to open the device file.
+        """Attempt to open the device.
 
         If opening fails, schedules a reconnection attempt and records the
         exception in ``self._open_error``.
 
-        Returns True if opening the device file succeded immediately,
+        Returns True if opening the device succeded immediately,
         False otherwise.  NB you must still await connected.wait()
         before using the device, because there may be further
         initialisation for the driver to perform.
         """
-        if self._f:
+        if self._transport is not None:
             return True
-        self._log.debug("trying to connect to %s...", self._path)
-        if self._glob:
-            path = glob.glob(self._path)
-        else:
-            path = [self._path]
+        self._log.debug("trying to connect to %s via %s...",
+                        self._path, self.backend)
         ex: Exception | None = None
+        try:
+            path = self._candidate_paths()
+        except ImportError:
+            # A missing dependency will not fix itself by retrying.
+            raise
+        except Exception as e:
+            path = []
+            ex = e
         if path:
             try:
-                if self._glob:
-                    self._log.debug("trying concrete path %s", path[0])
-                self._f = os.open(path[0], os.O_RDWR | os.O_NONBLOCK)
+                if self._glob or self._path is None:
+                    self._log.debug("trying concrete path %r", path[0])
+                self._transport = self._open_transport(path[0])
             except Exception as e:
-                self._f = None
+                self._transport = None
                 ex = e
-        else:
+        elif ex is None:
             self._log.debug("path %s not found", self._path)
-            ex = FileNotFoundError(self._path)
-        if not self._f:
+            ex = FileNotFoundError(
+                self._path if self._path is not None
+                else f"no {type(self).__name__} HID device found")
+        if self._transport is None:
             # It didn't work.  Schedule a reconnection attempt if we can.
             self._open_error = ex
             self._log.debug("hid failed to open %s (%s) - waiting to try again", self._path, ex)
@@ -206,9 +434,18 @@ class hid:
             return False
         self._open_error = None
         self._reconnect_count = 0
-        self._initialise_device()
-        self._log.debug("hid opened %s", path[0])
-        asyncio.get_running_loop().add_reader(self._f, self._reader)
+        self._log.debug("hid opened %r", path[0])
+        try:
+            self._initialise_device()
+        except OSError as e:
+            # The device vanished between opening and the first write;
+            # treat it like a failed open so reconnection keeps trying.
+            self._log.debug("hid failed to initialise %r (%s)", path[0], e)
+            self._transport.close()
+            self._transport = None
+            self._open_error = e
+            self._reconnect_task = asyncio.create_task(self._reconnect())
+            return False
         self.connection_status_callback._invoke("connected")
         return True
 
@@ -230,11 +467,10 @@ class hid:
         if self._reconnect_task:
             self._reconnect_task.cancel()
             self._reconnect_task = None
-        if self._f:
-            asyncio.get_running_loop().remove_reader(self._f)
-            os.close(self._f)
+        if self._transport is not None:
+            self._transport.close()
         self._shutdown_device()
-        self._f = None
+        self._transport = None
         self.connected.clear()
         self.connection_status_callback._invoke("disconnected")
         if reconnect:
@@ -255,7 +491,7 @@ class hid:
     @property
     def is_connected(self) -> bool:
         """True while the device is open and its handshake has completed."""
-        return self._f is not None and self.connected.is_set()
+        return self._transport is not None and self.connected.is_set()
 
     def new_dali_rx_queue(self) -> DistributorQueue:
         """Return a queue of DALI commands observed on the bus.
@@ -429,25 +665,24 @@ class hid:
         """
         pass
 
-    def _reader(self) -> None:
-        # The reader is only registered while the device file is open.
-        assert self._f is not None
-        try:
-            # No need to retry on InterruptedError since 3.5
-            data = os.read(self._f, 64)
-        except OSError:
-            # Device has gone away
-            data = b''
-        if len(data) == 0:
-            self.disconnect(reconnect=True)
-            return
-        self._handle_read(data)
+    def _device_lost(self) -> None:
+        """Called by the transport when the device has gone away."""
+        self.disconnect(reconnect=True)
+
+    def _raw_write(self, buf: bytes) -> None:
+        """Send one output report; raises OSError if the device has failed."""
+        if self._transport is None:
+            raise OSError("HID device is not open")
+        self._transport.write(buf)
 
     def _handle_read(self, data: bytes) -> None:
         pass
 
 
 class tridonic(hid):
+    usb_vendor_id = 0x17B5
+    usb_product_id = 0x0020
+
     # Commands sent to the interface
     # cmd, seq, ctrl, mode, frame (4 bytes), dtr, prio, devtype
     _cmdtmpl = struct.Struct(">4B4s3B53x")
@@ -550,9 +785,7 @@ class tridonic(hid):
 
     def _raw_write(self, buf: bytes) -> None:
         self._log.debug(f"_raw_write: {_hex(buf[0:self._cmdtmpl_useful_size])}")
-        # The device file is open whenever a command is transmitted.
-        assert self._f is not None
-        os.write(self._f, buf)
+        super()._raw_write(buf)
 
     def _initialise_device(self) -> None:
         # Read firmware version; pick up the reply in _handle_read
@@ -910,6 +1143,9 @@ class hasseb(hid):
     send a command it doesn't know that expects a response, the driver
     will deadlock.
     """
+    usb_vendor_id = 0x04CC
+    usb_product_id = 0x0802
+
     _cmdtmpl = struct.Struct("BB")
     _NO_DATA_AVAILABLE = 0
     _NO_ANSWER = 1
@@ -933,9 +1169,7 @@ class hasseb(hid):
         async with self._command_lock:
             times = 2 if command.sendtwice else 1
             for rep in range(times):
-                # Latent bug: hasseb defines no _raw_write (only tridonic
-                # does) so this raises AttributeError at runtime. Preserved.
-                self._raw_write(frame.pack_len(2))  # type: ignore[attr-defined]
+                self._raw_write(frame.pack_len(2))
             # Earlier commands may have left a response available that
             # we need to ignore.  We're only interested in responses
             # that become available in the future.
