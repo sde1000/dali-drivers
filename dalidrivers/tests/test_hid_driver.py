@@ -137,6 +137,36 @@ async def test_hidapi_connect_handshake_and_query():
     assert not d.is_connected
 
 
+def test_hidapi_reader_stops_when_loop_closed_without_disconnect():
+    # A program that crashes (or forgets to disconnect) lets asyncio.run()
+    # close the loop while the reader thread is still running.  The thread
+    # must then stop quietly instead of raising "Event loop is closed".
+    fake = FakeTridonicHidapi()
+    d = tridonic(backend="hidapi", hidapi_module=fake, reconnect_limit=0)
+    errors = []
+    old_hook = threading.excepthook
+    threading.excepthook = errors.append
+    try:
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(d.connect(timeout=2))
+        reader = d._transport._thread
+        # Shut down the loop the way asyncio.run() does
+        tasks = asyncio.all_tasks(loop)
+        for task in tasks:
+            task.cancel()
+        loop.run_until_complete(
+            asyncio.gather(*tasks, return_exceptions=True))
+        loop.close()
+        # Bus traffic arriving after the loop has gone
+        fake.reports.put(struct_response(
+            1, tridonic._RESPONSE_FRAME_DALI16, bytes(4)))
+        reader.join(timeout=2)
+        assert not reader.is_alive()
+    finally:
+        threading.excepthook = old_hook
+    assert errors == []
+
+
 @pytest.mark.asyncio
 async def test_hidapi_unplug_disconnects_and_reconnects():
     fake = FakeTridonicHidapi()

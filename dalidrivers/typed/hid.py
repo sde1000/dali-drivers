@@ -187,17 +187,23 @@ class _HidapiTransport:
         self._thread.start()
 
     def _read_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                data = self._dev.read(64, self._READ_TIMEOUT_MS)
-            except (OSError, ValueError):
-                # Device has gone away (hidapi raises IOError/OSError on
-                # read errors, ValueError if the device was closed).
-                if not self._stop.is_set():
-                    self._loop.call_soon_threadsafe(self._deliver_lost)
-                return
-            if data:
-                self._loop.call_soon_threadsafe(self._deliver, bytes(data))
+        try:
+            while not self._stop.is_set():
+                try:
+                    data = self._dev.read(64, self._READ_TIMEOUT_MS)
+                except (OSError, ValueError):
+                    # Device has gone away (hidapi raises IOError/OSError on
+                    # read errors, ValueError if the device was closed).
+                    if not self._stop.is_set():
+                        self._loop.call_soon_threadsafe(self._deliver_lost)
+                    return
+                if data:
+                    self._loop.call_soon_threadsafe(self._deliver, bytes(data))
+        except RuntimeError:
+            # The event loop was closed without close() being called, e.g.
+            # asyncio.run() finished after the program forgot to disconnect
+            # or crashed.  Nothing can receive reports any more, so stop.
+            return
 
     # These run on the event loop thread, as does close(), so checking
     # _closed here drops reports that were queued just before closing.
