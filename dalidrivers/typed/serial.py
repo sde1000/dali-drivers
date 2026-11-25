@@ -201,7 +201,9 @@ class DriverSerialBase:
             dev_inst_map = DeviceInstanceTypeMapper()
         self.dev_inst_map: DeviceInstanceTypeMapper = dev_inst_map
         self._connected = asyncio.Event()
-        # Assigned by the subclass once the asyncio transport protocol exists
+        # Assigned by the subclass once the asyncio transport and protocol
+        # exist; subclasses may narrow the transport type
+        self._transport: Optional[asyncio.BaseTransport] = None
         self._protocol: Any = None
         self.transaction_lock = asyncio.Lock()
 
@@ -260,9 +262,8 @@ class DriverSerialBase:
 
         :return: None
         """
-        transport = getattr(self, "_transport", None)
-        if transport is not None:
-            transport.close()
+        if self._transport is not None:
+            self._transport.close()
             self._transport = None
         self._connected.clear()
 
