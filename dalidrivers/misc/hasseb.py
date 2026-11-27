@@ -106,7 +106,7 @@ class HassebDALIUSBDriver(DALIDriver):
                     if (callable(progress_cb)):
                         progress_cb(cmd)
                 else:
-                    if cmd.devicetype != 0:
+                    if cmd.devicetype is not None:
                         self.send(EnableDeviceType(cmd.devicetype))
 
                     response = self.send(cmd)

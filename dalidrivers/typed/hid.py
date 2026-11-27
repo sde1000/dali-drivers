@@ -586,7 +586,7 @@ class hid:
                     command_sent = False
                     while not command_sent:
                         try:
-                            if cmd.devicetype != 0:
+                            if cmd.devicetype is not None:
                                 await self._send_raw(
                                     EnableDeviceType(cmd.devicetype)
                                 )
@@ -942,7 +942,7 @@ class tridonic(hid):
 
         # Command awaiting repeat or reply
         current_command: dali.command.Command | None = None
-        devicetype = 0
+        devicetype: int | None = None
 
         while True:
             # Wait for data
@@ -1072,7 +1072,7 @@ class tridonic(hid):
                 if TYPE_CHECKING:
                     # from_frame always returns a Command for a forward frame.
                     assert command is not None
-                devicetype = 0
+                devicetype = None
                 if command.sendtwice or command.response:
                     # We need more information.  Stash the command and wait.
                     current_command = command

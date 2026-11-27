@@ -9,6 +9,10 @@ Changes
   0471:0003), with 16-bit frames, backward-frame responses, optional bus
   power control, and offline HID protocol tests.
 - Move drivers with type annotations to dalidrivers.typed
+- Send ``EnableDeviceType`` for a command whose device type is 0,
+  fluorescent lamp control gear, which the drivers previously treated as
+  "send this command on its own".  Needs python-dali 1.0a3 or newer,
+  where ``Command.devicetype`` uses ``None`` for that instead.
 - Transmit and receive 32-bit frames in the LUBA serial driver and in the
   Tridonic DALI-USB driver, as IEC 62386-105 firmware transfer uses.  Needs
   python-dali with ``dali.firmware``.  See
