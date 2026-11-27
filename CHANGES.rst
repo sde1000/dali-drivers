@@ -13,6 +13,10 @@ Changes
   fluorescent lamp control gear, which the drivers previously treated as
   "send this command on its own".  Needs python-dali 1.0a3 or newer,
   where ``Command.devicetype`` uses ``None`` for that instead.
+- Transmit and receive 32-bit frames in the LUBA serial driver and in the
+  Tridonic DALI-USB driver, as IEC 62386-105 firmware transfer uses.  Needs
+  python-dali with ``dali.firmware``.  See
+  ``examples/async-firmware-update.py``.
 - The typed HID drivers (Tridonic DALI-USB, hasseb) gain a cross-platform
   hidapi backend (extra ``driver-hid``) so they also work on Windows and
   macOS; Linux keeps using hidraw directly by default.  Select with
